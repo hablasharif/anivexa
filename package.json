@@ -1,0 +1,13 @@
+{
+  "name": "anivexa-proxy",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "proxy.js",
+  "scripts": {
+    "start": "node proxy.js"
+  },
+  "dependencies": {
+    "https-proxy-agent": "^7.0.4",
+    "node-fetch": "^3.3.2"
+  }
+}
