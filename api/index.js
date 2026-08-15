@@ -25,14 +25,16 @@ export default async function handler(req) {
 
   const { targetUrl, referer, origin } = parsed;
   const headers = browserHeaders(targetUrl, referer, origin, req.headers);
+  const minHeaders = minimalHeaders(targetUrl, referer, req.headers);
 
   let upstreamResp;
   try {
-    upstreamResp = await fetch(targetUrl, {
-      method: req.method === 'HEAD' ? 'HEAD' : 'GET',
+    upstreamResp = await fetchWithFallback(
+      targetUrl,
+      req.method === 'HEAD' ? 'HEAD' : 'GET',
       headers,
-      redirect: 'follow'
-    });
+      minHeaders
+    );
   } catch (err) {
     return new Response(JSON.stringify({ error: 'Upstream request failed', detail: String(err) }), {
       status: 502,
@@ -42,8 +44,11 @@ export default async function handler(req) {
 
   const status = upstreamResp.status;
   const contentType = (upstreamResp.headers.get('Content-Type') || '').toLowerCase();
-  const isM3u8 = contentType.includes('mpegurl') || contentType.includes('x-mpegurl') || targetUrl.split('?')[0].endsWith('.m3u8');
-  const isMpd = contentType.includes('dash+xml') || targetUrl.split('?')[0].endsWith('.mpd');
+  const urlPath = targetUrl.split('?')[0].toLowerCase();
+  const isM3u8ByUrl = urlPath.endsWith('.m3u8') || urlPath.endsWith('.m3u');
+  const isTxtByUrl = urlPath.endsWith('.txt');
+  const isM3u8 = contentType.includes('mpegurl') || contentType.includes('x-mpegurl') || isM3u8ByUrl;
+  const isMpd = contentType.includes('dash+xml') || urlPath.endsWith('.mpd');
 
   if (req.method === 'HEAD') {
     const h = {
@@ -68,7 +73,23 @@ export default async function handler(req) {
     }
     return new Response(text, {
       status,
-      headers: { 'Content-Type': upstreamResp.headers.get('Content-Type') || 'text/html', ...corsHeaders() }
+      headers: { 'Content-Type': upstreamResp.headers.get('Content-Type') || 'text/plain', ...corsHeaders() }
+    });
+  }
+
+  // Handle .txt files that are actually HLS playlists
+  if (isTxtByUrl) {
+    const text = await upstreamResp.text();
+    if (isTxtPlaylist(text)) {
+      const rewritten = rewriteM3u8(text, targetUrl, referer, proxyBase);
+      return new Response(rewritten, {
+        status,
+        headers: { 'Content-Type': 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-cache', ...corsHeaders() }
+      });
+    }
+    return new Response(text, {
+      status,
+      headers: { 'Content-Type': 'text/plain', ...corsHeaders() }
     });
   }
 
@@ -100,6 +121,17 @@ export default async function handler(req) {
   if (ar) passHeaders['Accept-Ranges'] = ar;
 
   return new Response(upstreamResp.body, { status, headers: passHeaders });
+}
+
+async function fetchWithFallback(targetUrl, method, headers, minHeaders) {
+  let resp = await fetch(targetUrl, { method, headers, redirect: 'follow' });
+  if (resp.status === 403 || resp.status === 401 || resp.status === 400) {
+    const resp2 = await fetch(targetUrl, { method, headers: minHeaders, redirect: 'follow' });
+    if (resp2.status < resp.status || (resp2.status === 200 && resp.status !== 200)) {
+      resp = resp2;
+    }
+  }
+  return resp;
 }
 
 function corsHeaders() {
@@ -172,6 +204,21 @@ function browserHeaders(targetUrl, referer, origin, requestHeaders) {
   return h;
 }
 
+function minimalHeaders(targetUrl, referer, requestHeaders) {
+  const tHost = new URL(targetUrl).hostname;
+  const h = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Referer': referer || `https://${tHost}/`,
+  };
+  if (requestHeaders) {
+    const range = requestHeaders.get('Range') || requestHeaders.get('range');
+    if (range) h['Range'] = range;
+  }
+  return h;
+}
+
 function resolveUrl(rel, base) {
   if (/^https?:\/\//i.test(rel)) return rel;
   try { return new URL(rel, base).href; } catch (_) { return rel; }
@@ -180,6 +227,11 @@ function resolveUrl(rel, base) {
 function isPlaylistContent(text) {
   const t = text.trim();
   return t.startsWith('#EXTM3U') || t.includes('#EXT-X-STREAM-INF') || t.includes('#EXT-X-TARGETDURATION');
+}
+
+function isTxtPlaylist(text) {
+  const t = text.trim();
+  return t.startsWith('#EXTM3U') || t.includes('#EXT-X-TARGETDURATION') || t.includes('#EXTINF');
 }
 
 function rewriteM3u8(text, baseUrl, referer, proxyBase) {

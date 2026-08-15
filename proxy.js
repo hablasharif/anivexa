@@ -109,6 +109,22 @@ function browserHeaders(targetUrl, referer, origin, requestHeaders) {
   return h;
 }
 
+// Minimal headers — some CDNs block requests with Sec-* headers from server IPs
+function minimalHeaders(targetUrl, referer, requestHeaders) {
+  const tHost = new URL(targetUrl).hostname;
+  const h = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Referer': referer || `https://${tHost}/`,
+  };
+  if (requestHeaders) {
+    const range = requestHeaders.get('Range') || requestHeaders.get('range');
+    if (range) h['Range'] = range;
+  }
+  return h;
+}
+
 function resolveUrl(rel, base) {
   if (/^https?:\/\//i.test(rel)) return rel;
   try {
@@ -121,6 +137,12 @@ function resolveUrl(rel, base) {
 function isPlaylistContent(text) {
   const trimmed = text.trim();
   return trimmed.startsWith('#EXTM3U') || trimmed.includes('#EXT-X-STREAM-INF') || trimmed.includes('#EXT-X-TARGETDURATION');
+}
+
+// Detect if a .txt file is actually an HLS playlist
+function isTxtPlaylist(text) {
+  const trimmed = text.trim();
+  return trimmed.startsWith('#EXTM3U') || trimmed.includes('#EXT-X-TARGETDURATION') || trimmed.includes('#EXTINF');
 }
 
 function rewriteM3u8(text, baseUrl, referer, proxyBase) {
@@ -157,6 +179,21 @@ function rewriteMpd(text, baseUrl, referer, proxyBase) {
   return result;
 }
 
+async function fetchWithFallback(targetUrl, method, headers, minHeaders) {
+  // First attempt: full browser headers
+  let resp = await fetch(targetUrl, { method, headers, redirect: 'follow' });
+  
+  // If forbidden or auth error, retry with minimal headers (strips Sec-* that some CDNs block)
+  if (resp.status === 403 || resp.status === 401 || resp.status === 400) {
+    const resp2 = await fetch(targetUrl, { method, headers: minHeaders, redirect: 'follow' });
+    // Only use fallback if it's better
+    if (resp2.status < resp.status || (resp2.status === 200 && resp.status !== 200)) {
+      resp = resp2;
+    }
+  }
+  return resp;
+}
+
 async function handleRequest(request) {
   const reqUrl = new URL(request.url);
   const proxyBase = reqUrl.origin + reqUrl.pathname;
@@ -182,14 +219,16 @@ async function handleRequest(request) {
 
   const { targetUrl, referer, origin } = parsed;
   const headers = browserHeaders(targetUrl, referer, origin, request.headers);
+  const minHeaders = minimalHeaders(targetUrl, referer, request.headers);
 
   let upstreamResp;
   try {
-    upstreamResp = await fetch(targetUrl, {
-      method: request.method === 'HEAD' ? 'HEAD' : 'GET',
+    upstreamResp = await fetchWithFallback(
+      targetUrl,
+      request.method === 'HEAD' ? 'HEAD' : 'GET',
       headers,
-      redirect: 'follow'
-    });
+      minHeaders
+    );
   } catch (err) {
     return new Response(JSON.stringify({ error: 'Upstream request failed', detail: String(err) }), {
       status: 502,
@@ -199,8 +238,13 @@ async function handleRequest(request) {
 
   const status = upstreamResp.status;
   const contentType = (upstreamResp.headers.get('Content-Type') || '').toLowerCase();
-  const isM3u8 = contentType.includes('mpegurl') || contentType.includes('x-mpegurl') || targetUrl.split('?')[0].endsWith('.m3u8');
-  const isMpd = contentType.includes('dash+xml') || targetUrl.split('?')[0].endsWith('.mpd');
+
+  // Detect m3u8 by content-type OR URL extension
+  const urlPath = targetUrl.split('?')[0].toLowerCase();
+  const isM3u8ByUrl = urlPath.endsWith('.m3u8') || urlPath.endsWith('.m3u');
+  const isTxtByUrl = urlPath.endsWith('.txt');
+  const isM3u8 = contentType.includes('mpegurl') || contentType.includes('x-mpegurl') || isM3u8ByUrl;
+  const isMpd = contentType.includes('dash+xml') || urlPath.endsWith('.mpd');
 
   if (request.method === 'HEAD') {
     const h = {
@@ -230,7 +274,30 @@ async function handleRequest(request) {
     return new Response(text, {
       status,
       headers: {
-        'Content-Type': upstreamResp.headers.get('Content-Type') || 'text/html',
+        'Content-Type': upstreamResp.headers.get('Content-Type') || 'text/plain',
+        ...corsHeaders()
+      }
+    });
+  }
+
+  // Handle .txt files that are actually HLS playlists (e.g. index-v1-a1.txt)
+  if (isTxtByUrl) {
+    const text = await upstreamResp.text();
+    if (isTxtPlaylist(text)) {
+      const rewritten = rewriteM3u8(text, targetUrl, referer, proxyBase);
+      return new Response(rewritten, {
+        status,
+        headers: {
+          'Content-Type': 'application/vnd.apple.mpegurl',
+          'Cache-Control': 'no-cache',
+          ...corsHeaders()
+        }
+      });
+    }
+    return new Response(text, {
+      status,
+      headers: {
+        'Content-Type': 'text/plain',
         ...corsHeaders()
       }
     });
